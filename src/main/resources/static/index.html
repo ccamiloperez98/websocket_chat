@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chat con JWT</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/sockjs-client/1.6.1/sockjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+    <style>
+        body { font-family: Arial; margin: 20px; }
+        #chatSection { display: none; margin-top: 20px; }
+        #messages { border: 1px solid #ccc; height: 300px; overflow-y: auto; padding: 10px; margin-bottom: 10px; }
+        .message { margin: 5px 0; }
+        .message strong { color: #2196F3; }
+        .message small { color: #999; font-size: 0.8em; margin-left: 10px; }
+        .system { color: #666; font-style: italic; }
+        input, button { padding: 8px; margin: 5px; }
+        input[type="text"] { width: 200px; }
+        #messageInput { width: 300px; }
+    </style>
+</head>
+<body>
+<h2>Chat Room con JWT</h2>
+
+<!-- Panel de Login -->
+<div id="loginSection">
+    <h3>Login</h3>
+    <input type="text" id="email" placeholder="Usuario" />
+    <input type="password" id="password" placeholder="Contraseña" />
+    <button onclick="login()">Login</button>
+</div>
+
+<!-- Panel del Chat (se muestra después del login) -->
+<div id="chatSection">
+    <div>
+        <span>📢 Sala: </span>
+        <input type="text" id="roomId" value="general" style="width: 150px;" />
+        <button onclick="joinRoom()">Unirse a sala</button>
+        <button onclick="logout()">Logout</button>
+    </div>
+
+    <div id="messages">
+        <div class="system">🔐 Inicia sesión para conectarte</div>
+    </div>
+
+    <div>
+        <input type="text" id="messageInput" placeholder="Escribe un mensaje..." />
+        <button onclick="sendMessage()">Enviar</button>
+    </div>
+</div>
+
+<script>
+    let stompClient = null;
+    let jwtToken = null;
+    let currentUser = null;
+    let currentRoom = null;
+
+    // PASO 1: Login REST para obtener JWT
+    async function login() {
+        const email = document.getElementById('email').value;
+        const password = document.getElementById('password').value;
+
+        if (!email || !password) {
+            alert('Ingresa usuario y contraseña');
+            return;
+        }
+
+        try {
+            const response = await fetch('/auth', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password })
+            });
+
+            if (!response.ok) {
+                throw new Error('Credenciales inválidas');
+            }
+
+            const data = await response.json();
+            jwtToken = data.token;  // Guardar el token
+            currentUser = email;
+
+            console.log('✅ Login exitoso. Token:', jwtToken.substring(0, 30) + '...');
+
+            // Ocultar login, mostrar chat
+            document.getElementById('loginSection').style.display = 'none';
+            document.getElementById('chatSection').style.display = 'block';
+
+            // Conectar WebSocket
+            connectWebSocket();
+
+            // Limpiar mensajes
+            document.getElementById('messages').innerHTML = '';
+            addSystemMessage('✅ Login exitoso. Conectando al chat...');
+
+        } catch (error) {
+            console.error('Error de login:', error);
+            alert('Error de login: ' + error.message);
+        }
+    }
+
+    // PASO 2: Conectar WebSocket con JWT en headers STOMP
+    function connectWebSocket() {
+        // Crear conexión SockJS
+        const socket = new SockJS('http://localhost:8080/ws-chat');
+        stompClient = Stomp.over(socket);
+
+        // Deshabilitar logs de STOMP para limpiar consola
+        stompClient.debug = null;
+
+        // Headers de conexión con el JWT
+        const connectHeaders = {
+            'Authorization': `Bearer ${jwtToken}`
+        };
+
+        addSystemMessage('🔌 Conectando al servidor WebSocket...');
+
+        stompClient.connect(connectHeaders,
+            // Callback de éxito
+            function(frame) {
+                console.log('✅ Conectado al WebSocket:', frame);
+                addSystemMessage('✅ Conectado al servidor WebSocket');
+
+                // Suscribirse al topic público
+                stompClient.subscribe('/topic/public', function(message) {
+                    const chatMessage = JSON.parse(message.body);
+                    displayMessage(chatMessage);
+                });
+
+                // Si ya hay una sala seleccionada, unirse automáticamente
+                const roomId = document.getElementById('roomId').value;
+                if (roomId) {
+                    setTimeout(() => joinRoom(), 500);
+                }
+            },
+            // Callback de error
+            function(error) {
+                console.error('❌ Error de conexión WebSocket:', error);
+                addSystemMessage('❌ Error de conexión: ' + (error.body || error.message));
+
+                if (error.body && (error.body.includes('401') || error.body.includes('403'))) {
+                    addSystemMessage('🔒 Token inválido o expirado. Por favor, login nuevamente.');
+                    setTimeout(() => logout(), 2000);
+                }
+            }
+        );
+    }
+
+    // PASO 3: Unirse a una sala
+    function joinRoom() {
+        if (!stompClient || !stompClient.connected) {
+            addSystemMessage('⚠️ No estás conectado al servidor');
+            return;
+        }
+
+        currentRoom = document.getElementById('roomId').value;
+
+        const joinMessage = {
+            type: 'JOIN',
+            roomId: currentRoom,
+            content: currentUser + ' se unió a la sala'
+        };
+
+        stompClient.send('/app/chat.join', {}, JSON.stringify(joinMessage));
+        addSystemMessage(`👋 Te has unido a la sala: ${currentRoom}`);
+    }
+
+    // PASO 4: Enviar mensaje
+    function sendMessage() {
+        const input = document.getElementById('messageInput');
+        const content = input.value.trim();
+
+        if (!content) return;
+
+        if (!stompClient || !stompClient.connected) {
+            addSystemMessage('⚠️ No estás conectado al servidor');
+            return;
+        }
+
+        const chatMessage = {
+            type: 'CHAT',
+            content: content,
+            roomId: currentRoom || 'general'
+        };
+
+        stompClient.send('/app/chat.send', {}, JSON.stringify(chatMessage));
+        input.value = '';
+    }
+
+    // Mostrar mensaje en el chat
+    function displayMessage(message) {
+        const messagesDiv = document.getElementById('messages');
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'message';
+
+        const time = message.timestamp ? new Date(message.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
+
+        if (message.type === 'JOIN' || message.type === 'LEAVE') {
+            messageDiv.className = 'system';
+            messageDiv.innerHTML = `💬 ${message.content} <small>${time}</small>`;
+        } else {
+            messageDiv.innerHTML = `
+                    <strong>${message.sender || 'Anónimo'}:</strong>
+                    ${message.content}
+                    <small>${time}</small>
+                `;
+        }
+
+        messagesDiv.appendChild(messageDiv);
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    function addSystemMessage(text) {
+        const messagesDiv = document.getElementById('messages');
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'system';
+        messageDiv.innerHTML = `💬 ${text} <small>${new Date().toLocaleTimeString()}</small>`;
+        messagesDiv.appendChild(messageDiv);
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    // Logout: cerrar conexión y resetear estado
+    function logout() {
+        if (stompClient && stompClient.connected) {
+            stompClient.disconnect();
+        }
+        jwtToken = null;
+        currentUser = null;
+        currentRoom = null;
+
+        document.getElementById('loginSection').style.display = 'block';
+        document.getElementById('chatSection').style.display = 'none';
+        document.getElementById('email').value = '';
+        document.getElementById('password').value = '';
+    }
+
+    // Limpiar al cerrar la ventana
+    window.onbeforeunload = function() {
+        if (stompClient) {
+            stompClient.disconnect();
+        }
+    };
+</script>
+</body>
+</html>
